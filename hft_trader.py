@@ -1,6 +1,4 @@
-
 import ccxt.async_support as ccxt
-import pandas as pd
 import asyncio
 import os
 from datetime import datetime
@@ -9,70 +7,73 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ===== CONFIGURATION =====
 # SET TO TRUE ONLY WHEN READY TO TRADE REAL MONEY
-MAINNET_CONFIRMATION = True
+MAINNET_CONFIRMATION = False 
 
-BINANCE_API_KEY = os.getenv("BINANCE_KEY", "0NLIHcV6lIWDuCakzAAUSE2mq6BrxmDNHCn6l0lCPgq7AAFWcPiqkz2Q9eTbW9Ye")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "5LVq1iHl5MRAS56SHsrMmx4wAqe1TvURAvNLrlUR4hGcru6F8CpMjRzJK8BqtNiF")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "8488789199:AAGDbx-hu2993dG5O6LJEiSN0nEpFWuVWwk")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5665906172")
-
+BINANCE_API_KEY = os.getenv("BINANCE_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL = "BTC/USDT"
-TRADE_AMOUNT_USDT = 10.0  # Binance minimum is usually $10 for Spot
-VOLATILITY_THRESHOLD = 0.0002 # Slightly higher for real market noise
-PROFIT_TARGET = 0.0025       # 0.25% (Covers 0.1% buy fee + 0.1% sell fee + profit)
-STOP_LOSS = 0.0015           
+MARGIN_USD = 1.0      # Your actual $1
+LEVERAGE = 10         # 10x Leverage (Total position = $10)
+VOLATILITY_THRESHOLD = 0.0002 
+PROFIT_TARGET = 0.003 # 0.3% (Higher to cover Futures funding/fees)
+STOP_LOSS = 0.002     
 
-# Initialize exchange (Mainnet)
+# Initialize exchange (Futures Mainnet)
 exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    'options': {'defaultType': 'future'} # SWITCH TO FUTURES
 })
 
-# IMPORTANT: No sandbox mode here!
-if not MAINNET_CONFIRMATION:
-    print("!!! WARNING: MAINNET_CONFIRMATION is False. Bot will not start. !!!")
-
-bot_state = {"last_price": 0.0, "trades_today": 0, "active_trade_price": None, "btc_bought": 0.0}
+bot_state = {"last_price": 0.0, "active_pos": None, "amount_btc": 0.0}
 
 # ===== COMMANDS =====
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         balance = await exchange.fetch_balance()
+        # In Futures, look at 'USDT' in the total wallet
         usdt = balance['total'].get('USDT', 0)
-        btc = balance['total'].get('BTC', 0)
-        await update.message.reply_text(f"💰 <b>Real Balance</b>\nUSDT: ${usdt:,.2f}\nBTC: {btc:.6f}", parse_mode='HTML')
+        await update.message.reply_text(f"💰 <b>Futures Balance</b>\nUSDT: ${usdt:,.2f}\nLeverage: {LEVERAGE}x", parse_mode='HTML')
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 # ===== TRADING LOGIC =====
-async def execute_real_trade(side, price, application):
-    if not MAINNET_CONFIRMATION: return
-
+async def setup_leverage():
+    """Sets the leverage on Binance once at startup"""
     try:
-        if side == 'BUY':
-            # Calculate amount of BTC to buy for $10
-            quantity = TRADE_AMOUNT_USDT / price
-            order = await exchange.create_market_buy_order(SYMBOL, quantity)
-            bot_state['active_trade_price'] = price
-            bot_state['btc_bought'] = order['filled']
-        else:
-            # Sell the exact amount of BTC we bought
-            order = await exchange.create_market_sell_order(SYMBOL, bot_state['btc_bought'])
-            bot_state['active_trade_price'] = None
-            bot_state['btc_bought'] = 0.0
-        
-        bot_state['trades_today'] += 1
-        await application.bot.send_message(TELEGRAM_CHAT_ID, f"✅ <b>REAL {side}</b> at ${price:,.2f}")
+        await exchange.set_leverage(LEVERAGE, SYMBOL)
+        print(f"Leverage set to {LEVERAGE}x for {SYMBOL}")
     except Exception as e:
-        await application.bot.send_message(TELEGRAM_CHAT_ID, f"❌ <b>EXECUTION ERROR:</b> {e}")
+        print(f"Leverage Setup Error (Might already be set): {e}")
+
+async def execute_futures_trade(side, price, application):
+    if not MAINNET_CONFIRMATION: return
+    try:
+        # Calculate quantity: ($1 * 10 leverage) / current price
+        quantity = (MARGIN_USD * LEVERAGE) / price
+        
+        if side == 'BUY':
+            # Open Long
+            order = await exchange.create_market_buy_order(SYMBOL, quantity)
+            bot_state['active_pos'] = price
+            bot_state['amount_btc'] = order['amount']
+        else:
+            # Close Long
+            order = await exchange.create_market_sell_order(SYMBOL, bot_state['amount_btc'])
+            bot_state['active_pos'] = None
+        
+        emoji = "📈" if side == 'BUY' else "🏁"
+        await application.bot.send_message(TELEGRAM_CHAT_ID, f"{emoji} <b>FUTURES {side}</b> at ${price:,.2f}")
+    except Exception as e:
+        await application.bot.send_message(TELEGRAM_CHAT_ID, f"❌ <b>FUTURES ERROR:</b> {e}")
 
 async def hft_loop(application):
-    print("Real HFT Loop Active...")
+    await setup_leverage()
     prev_price = 0.0
-    
     while True:
         try:
             ticker = await exchange.fetch_ticker(SYMBOL)
@@ -82,17 +83,17 @@ async def hft_loop(application):
             if prev_price > 0:
                 change = (curr_price - prev_price) / prev_price
 
-                # Entry: Momentum
-                if change > VOLATILITY_THRESHOLD and not bot_state['active_trade_price']:
-                    await execute_real_trade('BUY', curr_price, application)
+                # Entry: Momentum Long
+                if change > VOLATILITY_THRESHOLD and not bot_state['active_pos']:
+                    await execute_futures_trade('BUY', curr_price, application)
 
                 # Exit: TP/SL
-                elif bot_state['active_trade_price']:
-                    entry = bot_state['active_trade_price']
+                elif bot_state['active_pos']:
+                    entry = bot_state['active_pos']
                     profit_pct = (curr_price - entry) / entry
                     
                     if profit_pct >= PROFIT_TARGET or profit_pct <= -STOP_LOSS:
-                        await execute_real_trade('SELL', curr_price, application)
+                        await execute_futures_trade('SELL', curr_price, application)
 
             prev_price = curr_price
             await asyncio.sleep(1) 
@@ -100,7 +101,9 @@ async def hft_loop(application):
             await asyncio.sleep(2)
 
 async def main():
-    if not MAINNET_CONFIRMATION: return
+    if not MAINNET_CONFIRMATION:
+        print("Set MAINNET_CONFIRMATION = True to trade.")
+        return
     
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("balance", balance_command))
